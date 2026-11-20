@@ -85,7 +85,7 @@ impl Blame {
 const GIT_BLAME_NO_COMMIT_ERROR: &str = "fatal: no such ref: HEAD";
 const GIT_BLAME_NO_PATH: &str = "fatal: no such path";
 const BLAME_PARSE_YIELD_INTERVAL: usize = 512;
-const EXACT_ENCODING_YIELD_BYTES: usize = 64 * 1024;
+const CONTENTS_YIELD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 enum BlameSource<'a> {
@@ -116,17 +116,13 @@ async fn stored_contents<'a>(
     let lines_encode_independently =
         encoding != ISO_2022_JP || stdin_encoding == StdinEncoding::WorkingTree;
     let mut encoder = ExactEncoder::new(encoding, has_bom);
-    let mut bytes_since_yield = 0;
+    let mut yield_budget = YieldBudget::default();
     for chunk in text::chunks_with_line_ending(content, line_ending) {
         if !lines_encode_independently && chunk.contains(['¥', '‾']) {
             return None;
         }
         encoder.encode(chunk)?;
-        bytes_since_yield += chunk.len();
-        if bytes_since_yield >= EXACT_ENCODING_YIELD_BYTES {
-            bytes_since_yield = 0;
-            smol::future::yield_now().await;
-        }
+        yield_budget.spend(chunk.len()).await;
     }
     encoder.finish()?;
     Some(BlameSource::StoredContents(
@@ -135,6 +131,21 @@ async fn stored_contents<'a>(
         encoding,
         has_bom,
     ))
+}
+
+#[derive(Default)]
+struct YieldBudget {
+    bytes: usize,
+}
+
+impl YieldBudget {
+    async fn spend(&mut self, bytes: usize) {
+        self.bytes += bytes;
+        if self.bytes >= CONTENTS_YIELD_BYTES {
+            self.bytes = 0;
+            smol::future::yield_now().await;
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -155,6 +166,7 @@ async fn git_stdin_encoding(
             "check-attr",
             "-z",
             "working-tree-encoding",
+            "diff",
             "--",
             path.as_unix_str(),
         ],
@@ -165,16 +177,19 @@ async fn git_stdin_encoding(
         "git check-attr failed: {}",
         String::from_utf8_lossy(&attributes.stderr)
     );
-    let attributes = String::from_utf8(attributes.stdout)?;
-    let has_working_tree_encoding =
-        attributes
-            .split('\0')
-            .tuples()
-            .any(|(_path, _attribute, value)| {
-                !matches!(value, "unspecified" | "unset" | "set")
-                    && !value.eq_ignore_ascii_case("utf-8")
-                    && !value.eq_ignore_ascii_case("utf8")
-            });
+    let mut working_tree_encoding: &[u8] = b"unspecified";
+    let mut diff_attribute: &[u8] = b"unspecified";
+    for (_path, attribute, value) in attributes.stdout.split(|byte| *byte == 0).tuples() {
+        match attribute {
+            b"working-tree-encoding" => working_tree_encoding = value,
+            b"diff" => diff_attribute = value,
+            _ => {}
+        }
+    }
+    let has_working_tree_encoding = !working_tree_encoding.is_empty()
+        && !matches!(working_tree_encoding, b"unspecified" | b"unset" | b"set")
+        && !working_tree_encoding.eq_ignore_ascii_case(b"utf-8")
+        && !working_tree_encoding.eq_ignore_ascii_case(b"utf8");
 
     if has_working_tree_encoding {
         return Ok(StdinEncoding::WorkingTree);
@@ -182,47 +197,51 @@ async fn git_stdin_encoding(
     if encoding == UTF_16LE || encoding == UTF_16BE {
         return Ok(StdinEncoding::Utf8);
     }
-    Ok(if history_has_textconv(git, path).await? {
+    Ok(if history_has_textconv(git, path, diff_attribute).await? {
         StdinEncoding::Utf8
     } else {
         StdinEncoding::Stored
     })
 }
 
-async fn history_has_textconv(git: &GitBinary, path: &RepoPath) -> Result<bool> {
-    let keys = preflight_output(
-        git,
-        &[
-            "config",
-            "-z",
-            "--name-only",
-            "--get-regexp",
-            r"^diff\..*\.textconv$",
-        ],
-    )
-    .await?;
+async fn history_has_textconv(
+    git: &GitBinary,
+    path: &RepoPath,
+    diff_attribute: &[u8],
+) -> Result<bool> {
+    let keys = preflight_output(git, &["config", "-z", "--name-only", "--list"]).await?;
     anyhow::ensure!(
-        matches!(keys.status.code(), Some(0 | 1)),
+        keys.status.success(),
         "git config failed: {}",
         String::from_utf8_lossy(&keys.stderr)
     );
-    let keys = String::from_utf8(keys.stdout)?;
     let drivers = keys
-        .split('\0')
-        .filter_map(|key| key.strip_prefix("diff.")?.strip_suffix(".textconv"))
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|key| key.strip_prefix(b"diff.")?.strip_suffix(b".textconv"))
         .collect::<Vec<_>>();
-    if drivers.is_empty() {
-        return Ok(false);
-    }
-    if drivers.iter().any(|driver| driver.contains('=')) {
+
+    // check-attr prints these for an attribute state and for a driver with that name.
+    let state_name = ["set", "unset", "unspecified"]
+        .into_iter()
+        .find(|state| state.as_bytes() == diff_attribute);
+    if state_name.is_none() && drivers.contains(&diff_attribute) {
         return Ok(true);
     }
+    let probed_drivers = ["default"]
+        .into_iter()
+        .chain(state_name)
+        .filter(|driver| drivers.contains(&driver.as_bytes()))
+        .collect::<Vec<_>>();
+    if probed_drivers.is_empty() {
+        return Ok(false);
+    }
 
-    // git can't report whether it would textconv a path so every textconv is replaced with a
-    // command that prints a marker, and the output shows whether git ran one.
+    // git can't report which of these drivers it would pick for a path so their textconv is
+    // replaced with a command that prints a marker, and the output shows whether git ran one.
     let marker = format!("zed-textconv-{}", Uuid::new_v4().simple());
     let mut args = Vec::new();
-    for driver in drivers {
+    for driver in probed_drivers {
         args.push("-c".to_string());
         args.push(format!("diff.{driver}.textconv=echo {marker} #"));
         args.push("-c".to_string());
@@ -313,10 +332,12 @@ async fn run_git_blame(
         }
         let stdin = stdin.context("failed to get pipe to stdin of git blame command")?;
         let mut stdin = BufWriter::new(stdin);
+        let mut yield_budget = YieldBudget::default();
         match source {
             BlameSource::Contents(contents, line_ending) => {
                 for chunk in text::chunks_with_line_ending(contents, line_ending) {
                     stdin.write_all(chunk.as_bytes()).await?;
+                    yield_budget.spend(chunk.len()).await;
                 }
             }
             BlameSource::StoredContents(contents, line_ending, encoding, has_bom) => {
@@ -326,6 +347,7 @@ async fn run_git_blame(
                         .encode(chunk)
                         .context("encoding the contents to blame")?;
                     stdin.write_all(bytes).await?;
+                    yield_budget.spend(chunk.len()).await;
                 }
                 let bytes = encoder.finish().context("encoding the contents to blame")?;
                 stdin.write_all(&bytes).await?;

@@ -17164,6 +17164,27 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
             "-text diff=set",
         ),
         case(
+            "latin_textconv_equals.py",
+            encoding_rs::WINDOWS_1252,
+            false,
+            windows_1252_text,
+            "-text diff=legacy=latin",
+        ),
+        case(
+            "sjis_diff_state.c",
+            encoding_rs::SHIFT_JIS,
+            false,
+            shift_jis_text,
+            "-text diff",
+        ),
+        case(
+            "latin_textconv_empty_working_tree_encoding.py",
+            encoding_rs::WINDOWS_1252,
+            false,
+            windows_1252_text,
+            "-text working-tree-encoding= diff=windows_1252",
+        ),
+        case(
             "utf_16le_textconv.txt",
             encoding_rs::UTF_16LE,
             true,
@@ -17241,6 +17262,11 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
     git_config(
         "diff.utf_16.textconv",
         "iconv -f UTF-16 -t UTF-8",
+        &work_dir,
+    );
+    git_config(
+        "diff.legacy=latin.textconv",
+        "iconv -f WINDOWS-1252 -t UTF-8",
         &work_dir,
     );
     let attributes = cases
