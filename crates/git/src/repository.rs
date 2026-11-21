@@ -5982,62 +5982,76 @@ mod tests {
         disable_git_global_config();
         cx.executor().allow_parking();
 
-        let directory = tempfile::tempdir().expect("create test repository directory");
-        let work_dir = directory.path();
-        git_init_repo(work_dir);
-        git_command(work_dir, ["config", "core.symlinks", "false"]);
-        git_command(
-            work_dir,
-            [
-                "config",
-                "diff.legacy=latin.textconv",
-                "iconv -f WINDOWS-1252 -t UTF-8",
-            ],
-        );
-        fs::write(
-            work_dir.join(".gitattributes"),
-            "* -text\nold.txt diff=legacy=latin\nlink.txt diff=legacy=latin\n",
-        )
-        .expect("write blame attributes");
-        // Git uses the supplied buffer when detecting the rename, so keep a long unchanged line.
+        // Git uses the supplied buffer for rename detection, so keep a long unchanged line.
         let contents = "café\ncrème\ndéjà\nunchanged ASCII line long enough for rename detection\n";
-        fs::write(
-            work_dir.join("old.txt"),
-            file_content::encode_text(contents.to_owned(), encoding_rs::WINDOWS_1252, false),
-        )
-        .expect("write rename source");
-        git_command(work_dir, ["add", ".gitattributes", "old.txt"]);
-        fs::write(work_dir.join("link.txt"), b"caf\xe9").expect("write link target as a file");
-        let target = git_command_output(work_dir, ["hash-object", "-w", "link.txt"]);
-        git_command(
-            work_dir,
-            [
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                "120000",
-                &target,
-                "link.txt",
-            ],
-        );
-        git_command(work_dir, ["commit", "-m", "Original files"]);
-        let original_commit: Oid = git_command_output(work_dir, ["rev-parse", "HEAD"])
-            .parse()
-            .expect("parse original commit ID");
-        git_command(work_dir, ["mv", "old.txt", "new.txt"]);
-
-        let repo = RealGitRepository::new(
-            &work_dir.join(".git"),
-            None,
-            Some("git".into()),
-            cx.executor(),
-        )
-        .expect("open test repository");
         let edited = contents.replace("crème", "changed");
-        for (name, buffer, original_name, expected_rows) in [
-            ("new.txt", edited.as_str(), "old.txt", vec![0, 2, 3]),
-            ("link.txt", "café", "link.txt", vec![0]),
+        let rename = ("new.txt", "old.txt", edited.as_str(), &[0, 2, 3][..]);
+        let link = ("link.txt", "link.txt", "café", &[0][..]);
+        for (attributes, driver, (name, original_name, buffer, expected_rows)) in [
+            ("old.txt diff=legacy=latin", "legacy=latin", rename),
+            ("new.txt diff=legacy=latin", "legacy=latin", rename),
+            ("other.txt diff=legacy=latin", "legacy=latin", rename),
+            ("*.txt diff=python", "default", rename),
+            ("link.txt diff=legacy=latin", "legacy=latin", link),
         ] {
+            let directory = tempfile::tempdir().expect("create test repository directory");
+            let work_dir = directory.path();
+            git_init_repo(work_dir);
+            git_command(work_dir, ["config", "core.symlinks", "false"]);
+            git_command(
+                work_dir,
+                [
+                    "config",
+                    &format!("diff.{driver}.textconv"),
+                    "iconv -f WINDOWS-1252 -t UTF-8",
+                ],
+            );
+            fs::write(
+                work_dir.join(".gitattributes"),
+                format!("* -text\n{attributes}\n"),
+            )
+            .expect("write blame attributes");
+            git_command(work_dir, ["add", ".gitattributes"]);
+            if name == original_name {
+                fs::write(work_dir.join(name), b"caf\xe9").expect("write link target as a file");
+                let target = git_command_output(work_dir, ["hash-object", "-w", name]);
+                git_command(
+                    work_dir,
+                    [
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        "120000",
+                        &target,
+                        name,
+                    ],
+                );
+            } else {
+                fs::write(
+                    work_dir.join(original_name),
+                    file_content::encode_text(
+                        contents.to_owned(),
+                        encoding_rs::WINDOWS_1252,
+                        false,
+                    ),
+                )
+                .expect("write rename source");
+                git_command(work_dir, ["add", original_name]);
+            }
+            git_command(work_dir, ["commit", "-m", "Original file"]);
+            let original_commit: Oid = git_command_output(work_dir, ["rev-parse", "HEAD"])
+                .parse()
+                .expect("parse original commit ID");
+            if name != original_name {
+                git_command(work_dir, ["mv", original_name, name]);
+            }
+            let repo = RealGitRepository::new(
+                &work_dir.join(".git"),
+                None,
+                Some("git".into()),
+                cx.executor(),
+            )
+            .expect("open test repository");
             let blame = repo
                 .blame(
                     repo_path(name),
@@ -6057,7 +6071,10 @@ mod tests {
                 );
                 rows.extend(entry.range);
             }
-            assert_eq!(rows, expected_rows, "committed rows for {name}");
+            assert_eq!(
+                rows, expected_rows,
+                "committed rows for {name} with {attributes}"
+            );
         }
     }
 

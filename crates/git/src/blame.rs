@@ -232,7 +232,7 @@ async fn history_may_use_textconv(git: &GitBinary, path: &RepoPath) -> Result<bo
     // Only Git knows which driver applies to the historical object, including its mode.
     let marker = format!("zed-textconv-{}", Uuid::new_v4().simple());
     let marker_command = format!("echo {marker} #");
-    let mut command = git.build_command::<&str>(&[]);
+    let mut overrides = Vec::<OsString>::new();
     for driver in keys
         .stdout
         .split(|byte| *byte == 0)
@@ -250,23 +250,76 @@ async fn history_may_use_textconv(git: &GitBinary, path: &RepoPath) -> Result<bo
         ] {
             let mut option = OsString::new();
             let config_value = if needs_config_env {
-                command.env(variable, value);
                 option.push("--config-env=");
                 variable
             } else {
-                command.arg("-c");
+                overrides.push("-c".into());
                 value
             };
             option.push(driver);
             option.push(setting);
             option.push(config_value);
-            command.arg(option);
+            overrides.push(option);
         }
     }
 
+    let probe = |path: OsString| {
+        let mut command = git.build_command(&overrides);
+        let mut object = OsString::from("HEAD:");
+        object.push(path);
+        command
+            .args(["cat-file", "--textconv"])
+            .arg(object)
+            .env("ZED_BLAME_TEXTCONV", &marker_command)
+            .env("ZED_BLAME_CACHE_TEXTCONV", "false");
+        probe_textconv(command, marker.as_bytes())
+    };
+    if let Some(selected) = probe(path.as_unix_str().into()).await? {
+        return Ok(selected);
+    }
+
+    let renames = git
+        .build_command(&[
+            "diff",
+            "--cached",
+            "--find-renames",
+            "--diff-filter=R",
+            "--name-status",
+            "-z",
+            "--no-relative",
+            "--",
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    anyhow::ensure!(
+        renames.status.success(),
+        "git diff failed: {}",
+        String::from_utf8_lossy(&renames.stderr)
+    );
+    let source =
+        renames
+            .stdout
+            .split(|byte| *byte == 0)
+            .tuples()
+            .find_map(|(_, source, destination)| {
+                (destination == path.as_unix_str().as_bytes()).then_some(source)
+            });
+    if let Some(source) = source {
+        #[cfg(unix)]
+        let source = OsStr::from_bytes(source);
+        #[cfg(not(unix))]
+        let source = OsStr::new(std::str::from_utf8(source)?);
+        return Ok(probe(source.into()).await?.unwrap_or(true));
+    }
+    Ok(true)
+}
+
+async fn probe_textconv(
+    mut command: util::command::Command,
+    marker: &[u8],
+) -> Result<Option<bool>> {
     let mut child = command
-        .args(["cat-file", "--textconv"])
-        .arg(format!("HEAD:{}", path.as_unix_str()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -282,14 +335,13 @@ async fn history_may_use_textconv(git: &GitBinary, path: &RepoPath) -> Result<bo
         .take(marker.len() as u64)
         .read_to_end(&mut output)
         .await?;
-    if output == marker.as_bytes() {
-        return Ok(true);
+    if output == marker {
+        return Ok(Some(true));
     }
-    if output.len() < marker.len() {
-        // A staged rename can still use the old path's converter when this probe fails.
-        return Ok(!child.status().await?.success());
+    if output.len() < marker.len() && !child.status().await?.success() {
+        return Ok(None);
     }
-    Ok(false)
+    Ok(Some(false))
 }
 
 async fn run_git_blame(
