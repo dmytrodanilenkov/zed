@@ -17115,8 +17115,8 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
         replacement: "changed",
         committed_rows: outer_rows.clone(),
     };
-    let strip_bom = "utf_8_bom_textconv.txt";
-    let keep_bom = "utf_8_bom_identity.txt";
+    let strip_bom = "bom/strip.txt";
+    let keep_bom = "bom/keep.txt";
     let cases = [
         case("sjis.c", encoding_rs::SHIFT_JIS, false, shift_jis_text, ""),
         case(
@@ -17187,14 +17187,14 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
             encoding_rs::UTF_8,
             true,
             unicode_text,
-            "text eol=lf working-tree-encoding=UTF-8//IGNORE diff=strip_bom",
+            "text eol=lf working-tree-encoding=UTF-8//IGNORE",
         ),
         case(
             keep_bom,
             encoding_rs::UTF_8,
             true,
             unicode_text,
-            "text eol=lf working-tree-encoding=UTF-8//IGNORE diff=keep_bom",
+            "text eol=lf working-tree-encoding=UTF-8//IGNORE",
         ),
         case(
             "iso_2022_jp_ascii_path.txt",
@@ -17329,6 +17329,13 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
         .map(|case| format!("{} {}\n", case.file_name, case.attributes))
         .collect::<String>();
     std::fs::write(work_dir.join(".gitattributes"), attributes).unwrap();
+    std::fs::create_dir(work_dir.join("bom")).expect("create BOM fixture directory");
+    std::fs::write(
+        work_dir.join("bom/.gitattributes"),
+        "strip.txt diff=strip_bom\nkeep.txt diff=keep_bom\n",
+    )
+    .expect("write BOM converter attributes");
+    git_add("bom/.gitattributes", &work_dir);
     git_add(".gitattributes", &work_dir);
     for case in &cases {
         let bytes = match case.stored_bytes {
@@ -17355,6 +17362,20 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
     let bom_commit: git::Oid = git_rev_parse("HEAD", &work_dir)
         .parse()
         .expect("BOM commit SHA");
+
+    // The staged contents have no BOM. Blame still compares the unsaved buffer
+    // with the converted HEAD blob, using attributes that can be present only in the index.
+    for file in [strip_bom, keep_bom] {
+        std::fs::write(work_dir.join(file), "staged contents\n").expect("write staged contents");
+        git_add(file, &work_dir);
+        std::fs::write(
+            work_dir.join(file),
+            file_content::encode_text(unicode_text.to_owned(), encoding_rs::UTF_8, true),
+        )
+        .expect("restore working contents");
+    }
+    std::fs::remove_file(work_dir.join("bom/.gitattributes"))
+        .expect("leave attributes in the index");
 
     let project = Project::test(RealFs::new(None, cx.executor()), [root.path()], cx).await;
     let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());

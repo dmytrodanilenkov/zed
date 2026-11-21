@@ -282,51 +282,37 @@ async fn history_needs_utf8(git: &GitBinary, path: &RepoPath, utf8_bom: bool) ->
         }
     }
 
-    // An index object lookup loads indexed attributes when .gitattributes is
-    // missing on disk. Use it when the index has the historical file mode.
-    let literal_path = format!(":(top,literal){}", path.as_unix_str());
-    let changes = git
-        .build_command(&[
-            "diff",
-            "--cached",
-            "--raw",
-            "--no-renames",
-            "-z",
-            "--",
-            &literal_path,
-        ])
+    let object = format!("HEAD:{}", path.as_unix_str());
+    let kind = git
+        .build_command(&["cat-file", "-t", &object])
         .kill_on_drop(true)
         .output()
         .await?;
-    anyhow::ensure!(
-        changes.status.success(),
-        "git diff failed: {}",
-        String::from_utf8_lossy(&changes.stderr)
-    );
-    let change = changes
-        .stdout
-        .split(|byte| *byte == 0)
-        .tuples()
-        .find_map(|(metadata, name)| (name == path.as_unix_str().as_bytes()).then_some(metadata));
-    let head = format!("HEAD:{}", path.as_unix_str());
-    let index = format!(":{}", path.as_unix_str());
-    let (driver_object, contents_object) = match change.and_then(|metadata| metadata.last()) {
-        // The previous path may have been a directory. Blame can also follow
-        // a different source from the rename recorded in the index.
-        Some(b'A' | b'U') => return Ok(true),
-        Some(b'M') => (&index, &head),
-        Some(_) => (&head, &head),
-        None => (&index, &index),
-    };
+    // Blame may follow the unsaved contents to a different source than the index would choose.
+    if !kind.status.success() || kind.stdout.trim_ascii_end() != b"blob" {
+        return Ok(true);
+    }
+
+    // Resolving an index revision makes Git load indexed attributes when their
+    // working copy is missing, as blame does. Git forbids tracking .git, so
+    // --ignore-missing discards this second revision and only the HEAD blob is shown.
+    let arguments = [
+        "show",
+        "--textconv",
+        "--ignore-missing",
+        &object,
+        ":.git",
+        "--",
+    ];
     let mut command = git.build_command(&overrides);
     command
-        .args(["cat-file", "--textconv", driver_object])
+        .args(arguments)
         .env("ZED_BLAME_TEXTCONV", &marker_command)
         .env("ZED_BLAME_CACHE_TEXTCONV", "false");
     match probe_prefix(command, marker.as_bytes()).await? {
         Some(false) => Ok(false),
         Some(true) if utf8_bom => {
-            let command = git.build_command(&["cat-file", "--textconv", contents_object]);
+            let command = git.build_command(&arguments);
             Ok(probe_prefix(command, b"\xef\xbb\xbf").await? != Some(true))
         }
         _ => Ok(true),
@@ -340,11 +326,11 @@ async fn probe_prefix(mut command: util::command::Command, prefix: &[u8]) -> Res
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .context("starting git cat-file process")?;
+        .context("starting Git textconv probe")?;
     let stdout = child
         .stdout
         .take()
-        .context("failed to get stdout from git cat-file command")?;
+        .context("failed to get stdout from Git textconv probe")?;
     let mut output = Vec::new();
     stdout
         .take(prefix.len() as u64)
