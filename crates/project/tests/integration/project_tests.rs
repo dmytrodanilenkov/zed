@@ -17094,6 +17094,7 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
         text: &'static str,
         stored_bytes: Option<&'static [u8]>,
         attributes: &'static str,
+        first_edited_row: u32,
         replacement: &'static str,
         committed_rows: Vec<Range<u32>>,
     }
@@ -17110,17 +17111,25 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
         text,
         stored_bytes: None,
         attributes,
+        first_edited_row: 1,
         replacement: "changed",
         committed_rows: outer_rows.clone(),
     };
     let cases = [
         case("sjis.c", encoding_rs::SHIFT_JIS, false, shift_jis_text, ""),
         case(
-            "latin.py",
+            "latin_without_textconv.py",
             encoding_rs::WINDOWS_1252,
             false,
             windows_1252_text,
             "",
+        ),
+        case(
+            "latin_textconv_equals.py",
+            encoding_rs::WINDOWS_1252,
+            false,
+            windows_1252_text,
+            "-text diff=legacy=latin",
         ),
         Case {
             stored_bytes: Some(b"\x1b$B>e$N9T\x1b(B\nplain\n\x1b$B:G8e$N9T\x1b(B\n"),
@@ -17143,7 +17152,41 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
                 "",
             )
         },
+        // The escape on the preceding line makes the same byte display differently in history.
+        Case {
+            stored_bytes: Some(b"\x1b(J\\\n\\\x1b$BF|\x1b(B\nlast\n"),
+            first_edited_row: 0,
+            replacement: "new\n\\日",
+            committed_rows: vec![2..3],
+            ..case(
+                "iso_2022_jp_historical_yen.txt",
+                encoding_rs::ISO_2022_JP,
+                false,
+                "¥\n¥日\nlast\n",
+                "-text",
+            )
+        },
+        Case {
+            stored_bytes: Some(b"\x1b(J~\n~\x1b$BF|\x1b(B\nlast\n"),
+            first_edited_row: 0,
+            replacement: "new\n~日",
+            committed_rows: vec![2..3],
+            ..case(
+                "iso_2022_jp_historical_overline.txt",
+                encoding_rs::ISO_2022_JP,
+                false,
+                "‾\n‾日\nlast\n",
+                "-text",
+            )
+        },
         case("utf_8_bom.txt", encoding_rs::UTF_8, true, unicode_text, ""),
+        case(
+            "utf_8_bom_textconv.txt",
+            encoding_rs::UTF_8,
+            true,
+            unicode_text,
+            "text eol=lf working-tree-encoding=UTF-8// diff=strip_bom",
+        ),
         // Git can't split raw UTF-16 into lines.
         Case {
             committed_rows: Vec::new(),
@@ -17162,13 +17205,6 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
             false,
             windows_1252_text,
             "-text diff=set",
-        ),
-        case(
-            "latin_textconv_equals.py",
-            encoding_rs::WINDOWS_1252,
-            false,
-            windows_1252_text,
-            "-text diff=legacy=latin",
         ),
         case(
             "sjis_diff_state.c",
@@ -17269,6 +17305,7 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
         "iconv -f WINDOWS-1252 -t UTF-8",
         &work_dir,
     );
+    git_config("diff.strip_bom.textconv", "tail -c +4", &work_dir);
     let attributes = cases
         .iter()
         .filter(|case| !case.attributes.is_empty())
@@ -17306,8 +17343,8 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
             assert_eq!(buffer.encoding(), case.encoding, "encoding of {file_name}");
             assert_eq!(buffer.has_bom(), case.has_bom, "BOM of {file_name}");
             assert_eq!(buffer.text(), case.text, "text of {file_name}");
-            let middle_line = Point::new(1, 0)..Point::new(1, buffer.line_len(1));
-            buffer.edit([(middle_line, case.replacement)], None, cx);
+            let range = Point::new(case.first_edited_row, 0)..Point::new(1, buffer.line_len(1));
+            buffer.edit([(range, case.replacement)], None, cx);
         });
 
         let blame = project
@@ -17334,6 +17371,7 @@ async fn test_blame_buffer_with_default_textconv(cx: &mut gpui::TestAppContext) 
 
     let text = "x = \"café\"\ny = \"crème brûlée\"\nz = \"déjà vu\"\n";
     let reencoded_file_name = "reencoded_after_commit.py";
+    let committed_reencoding = "reencoded_in_history.py";
     let file_names = [
         "unspecified.py",
         "unknown_driver.py",
@@ -17345,6 +17383,7 @@ async fn test_blame_buffer_with_default_textconv(cx: &mut gpui::TestAppContext) 
         "driver_named_set.py",
         "driver_named_unset.py",
         reencoded_file_name,
+        committed_reencoding,
     ];
 
     let root = TempTree::new(json!({ "project": {} }));
@@ -17378,7 +17417,7 @@ async fn test_blame_buffer_with_default_textconv(cx: &mut gpui::TestAppContext) 
         "diff_unset.py -diff",
         "driver_named_set.py diff=set",
         "driver_named_unset.py diff=unset",
-        "reencoded_after_commit.py diff=adaptive",
+        "reencoded_*.py diff=adaptive",
     ];
     std::fs::write(
         work_dir.join(".gitattributes"),
@@ -17387,7 +17426,7 @@ async fn test_blame_buffer_with_default_textconv(cx: &mut gpui::TestAppContext) 
     .unwrap();
     git_add(".gitattributes", &work_dir);
     for file_name in file_names {
-        let encoding = if file_name == reencoded_file_name {
+        let encoding = if [reencoded_file_name, committed_reencoding].contains(&file_name) {
             encoding_rs::UTF_8
         } else {
             encoding_rs::WINDOWS_1252
@@ -17397,11 +17436,16 @@ async fn test_blame_buffer_with_default_textconv(cx: &mut gpui::TestAppContext) 
         git_add(file_name, &work_dir);
     }
     git_commit("Initial commit", &work_dir);
-    std::fs::write(
-        work_dir.join(reencoded_file_name),
-        file_content::encode_text(text.to_owned(), encoding_rs::WINDOWS_1252, false),
-    )
-    .unwrap();
+    let original_commit: git::Oid = git_rev_parse("HEAD", &work_dir)
+        .parse()
+        .expect("rev-parse HEAD should return the original commit ID");
+    let reencoded_bytes =
+        file_content::encode_text(text.to_owned(), encoding_rs::WINDOWS_1252, false);
+    for file_name in [reencoded_file_name, committed_reencoding] {
+        std::fs::write(work_dir.join(file_name), &reencoded_bytes).unwrap();
+    }
+    git_add(committed_reencoding, &work_dir);
+    git_commit("Change only the encoding", &work_dir);
 
     let project = Project::test(RealFs::new(None, cx.executor()), [root.path()], cx).await;
     let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
@@ -17433,9 +17477,9 @@ async fn test_blame_buffer_with_default_textconv(cx: &mut gpui::TestAppContext) 
             blame
                 .entries
                 .iter()
-                .map(|entry| entry.range.clone())
+                .map(|entry| (entry.range.clone(), entry.sha))
                 .collect::<Vec<_>>(),
-            vec![0..1, 2..3],
+            vec![(0..1, original_commit), (2..3, original_commit)],
             "blame of {file_name}"
         );
     }
@@ -22114,7 +22158,6 @@ fn git_checkout(name: &str, work_dir: &Path) {
     );
 }
 
-#[cfg(any())]
 #[allow(clippy::disallowed_methods)]
 #[track_caller]
 fn git_rev_parse(rev: &str, work_dir: &Path) -> String {

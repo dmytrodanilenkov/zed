@@ -5978,6 +5978,90 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_blame_with_textconv_for_staged_rename_and_symlink(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let directory = tempfile::tempdir().expect("create test repository directory");
+        let work_dir = directory.path();
+        git_init_repo(work_dir);
+        git_command(work_dir, ["config", "core.symlinks", "false"]);
+        git_command(
+            work_dir,
+            [
+                "config",
+                "diff.legacy=latin.textconv",
+                "iconv -f WINDOWS-1252 -t UTF-8",
+            ],
+        );
+        fs::write(
+            work_dir.join(".gitattributes"),
+            "* -text\nold.txt diff=legacy=latin\nlink.txt diff=legacy=latin\n",
+        )
+        .expect("write blame attributes");
+        // Git uses the supplied buffer when detecting the rename, so keep a long unchanged line.
+        let contents = "café\ncrème\ndéjà\nunchanged ASCII line long enough for rename detection\n";
+        fs::write(
+            work_dir.join("old.txt"),
+            file_content::encode_text(contents.to_owned(), encoding_rs::WINDOWS_1252, false),
+        )
+        .expect("write rename source");
+        git_command(work_dir, ["add", ".gitattributes", "old.txt"]);
+        fs::write(work_dir.join("link.txt"), b"caf\xe9").expect("write link target as a file");
+        let target = git_command_output(work_dir, ["hash-object", "-w", "link.txt"]);
+        git_command(
+            work_dir,
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "120000",
+                &target,
+                "link.txt",
+            ],
+        );
+        git_command(work_dir, ["commit", "-m", "Original files"]);
+        let original_commit: Oid = git_command_output(work_dir, ["rev-parse", "HEAD"])
+            .parse()
+            .expect("parse original commit ID");
+        git_command(work_dir, ["mv", "old.txt", "new.txt"]);
+
+        let repo = RealGitRepository::new(
+            &work_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("open test repository");
+        let edited = contents.replace("crème", "changed");
+        for (name, buffer, original_name, expected_rows) in [
+            ("new.txt", edited.as_str(), "old.txt", vec![0, 2, 3]),
+            ("link.txt", "café", "link.txt", vec![0]),
+        ] {
+            let blame = repo
+                .blame(
+                    repo_path(name),
+                    Rope::from(buffer),
+                    LineEnding::Unix,
+                    encoding_rs::WINDOWS_1252,
+                    false,
+                )
+                .await
+                .expect("blame working-tree contents");
+            let mut rows = Vec::new();
+            for entry in blame.entries {
+                assert_eq!(entry.sha, original_commit, "commit for {name}");
+                assert_eq!(
+                    entry.filename, original_name,
+                    "original filename for {name}"
+                );
+                rows.extend(entry.range);
+            }
+            assert_eq!(rows, expected_rows, "committed rows for {name}");
+        }
+    }
+
+    #[gpui::test]
     async fn test_blame_untracked_path_with_large_contents(cx: &mut TestAppContext) {
         disable_git_global_config();
         cx.executor().allow_parking();

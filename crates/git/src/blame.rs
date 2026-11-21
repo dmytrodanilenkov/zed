@@ -10,7 +10,10 @@ use futures::{AsyncWriteExt, TryFutureExt, try_join};
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 use smol::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use std::ffi::{OsStr, OsString};
 use std::ops::Range;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
 use text::{LineEnding, Rope};
 use time::OffsetDateTime;
 use time::UtcOffset;
@@ -118,7 +121,8 @@ async fn stored_contents<'a>(
     let mut encoder = ExactEncoder::new(encoding, has_bom);
     let mut yield_budget = YieldBudget::default();
     for chunk in text::chunks_with_line_ending(content, line_ending) {
-        if !lines_encode_independently && chunk.contains(['¥', '‾']) {
+        // In history, JIS Roman state from a preceding line can make 0x5C and 0x7E mean ¥ and ‾.
+        if !lines_encode_independently && chunk.contains(['¥', '‾', '\\', '~']) {
             return None;
         }
         encoder.encode(chunk)?;
@@ -160,99 +164,109 @@ async fn git_stdin_encoding(
     path: &RepoPath,
     encoding: &'static Encoding,
 ) -> Result<StdinEncoding> {
-    let attributes = preflight_output(
-        git,
-        &[
-            "check-attr",
-            "-z",
-            "working-tree-encoding",
-            "diff",
-            "--",
-            path.as_unix_str(),
-        ],
-    )
-    .await?;
-    anyhow::ensure!(
-        attributes.status.success(),
-        "git check-attr failed: {}",
-        String::from_utf8_lossy(&attributes.stderr)
-    );
-    let mut working_tree_encoding: &[u8] = b"unspecified";
-    let mut diff_attribute: &[u8] = b"unspecified";
-    for (_path, attribute, value) in attributes.stdout.split(|byte| *byte == 0).tuples() {
-        match attribute {
-            b"working-tree-encoding" => working_tree_encoding = value,
-            b"diff" => diff_attribute = value,
-            _ => {}
-        }
-    }
-    let has_working_tree_encoding = !working_tree_encoding.is_empty()
-        && !matches!(working_tree_encoding, b"unspecified" | b"unset" | b"set")
-        && !working_tree_encoding.eq_ignore_ascii_case(b"utf-8")
-        && !working_tree_encoding.eq_ignore_ascii_case(b"utf8");
-
-    if has_working_tree_encoding {
+    // A UTF-8 buffer can have an iconv alias in the attributes and a textconv that strips its BOM.
+    if encoding != UTF_8 && has_working_tree_encoding(git, path).await? {
         return Ok(StdinEncoding::WorkingTree);
     }
     if encoding == UTF_16LE || encoding == UTF_16BE {
         return Ok(StdinEncoding::Utf8);
     }
-    Ok(if history_has_textconv(git, path, diff_attribute).await? {
+    Ok(if history_may_use_textconv(git, path).await? {
         StdinEncoding::Utf8
     } else {
         StdinEncoding::Stored
     })
 }
 
-async fn history_has_textconv(
-    git: &GitBinary,
-    path: &RepoPath,
-    diff_attribute: &[u8],
-) -> Result<bool> {
-    let keys = preflight_output(git, &["config", "-z", "--name-only", "--list"]).await?;
+async fn has_working_tree_encoding(git: &GitBinary, path: &RepoPath) -> Result<bool> {
+    let attributes = git
+        .build_command(&[
+            "check-attr",
+            "-z",
+            "working-tree-encoding",
+            "--",
+            path.as_unix_str(),
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await?;
     anyhow::ensure!(
-        keys.status.success(),
+        attributes.status.success(),
+        "git check-attr failed: {}",
+        String::from_utf8_lossy(&attributes.stderr)
+    );
+    Ok(attributes
+        .stdout
+        .split(|byte| *byte == 0)
+        .tuples()
+        .any(|(_path, _attribute, value)| {
+            !matches!(value, b"" | b"unspecified" | b"unset" | b"set")
+                && !value.eq_ignore_ascii_case(b"utf-8")
+                && !value.eq_ignore_ascii_case(b"utf8")
+        }))
+}
+
+async fn history_may_use_textconv(git: &GitBinary, path: &RepoPath) -> Result<bool> {
+    let keys = git
+        .build_command(&[
+            "config",
+            "-z",
+            "--name-only",
+            "--get-regexp",
+            r"^diff\..*\.textconv$",
+        ])
+        // Git's regex must match driver names containing non-UTF-8 bytes, too.
+        .env("LC_ALL", "C")
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    anyhow::ensure!(
+        matches!(keys.status.code(), Some(0 | 1)),
         "git config failed: {}",
         String::from_utf8_lossy(&keys.stderr)
     );
-    let drivers = keys
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter_map(|key| key.strip_prefix(b"diff.")?.strip_suffix(b".textconv"))
-        .collect::<Vec<_>>();
-
-    // check-attr prints these for an attribute state and for a driver with that name.
-    let state_name = ["set", "unset", "unspecified"]
-        .into_iter()
-        .find(|state| state.as_bytes() == diff_attribute);
-    if state_name.is_none() && drivers.contains(&diff_attribute) {
-        return Ok(true);
-    }
-    let probed_drivers = ["default"]
-        .into_iter()
-        .chain(state_name)
-        .filter(|driver| drivers.contains(&driver.as_bytes()))
-        .collect::<Vec<_>>();
-    if probed_drivers.is_empty() {
+    if keys.stdout.is_empty() {
         return Ok(false);
     }
 
-    // git can't report which of these drivers it would pick for a path so their textconv is
-    // replaced with a command that prints a marker, and the output shows whether git ran one.
+    // Only Git knows which driver applies to the historical object, including its mode.
     let marker = format!("zed-textconv-{}", Uuid::new_v4().simple());
-    let mut args = Vec::new();
-    for driver in probed_drivers {
-        args.push("-c".to_string());
-        args.push(format!("diff.{driver}.textconv=echo {marker} #"));
-        args.push("-c".to_string());
-        args.push(format!("diff.{driver}.cachetextconv=false"));
+    let marker_command = format!("echo {marker} #");
+    let mut command = git.build_command::<&str>(&[]);
+    for driver in keys
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|key| key.strip_suffix(b".textconv"))
+    {
+        // Older Git accepts -c for ordinary keys. Only --config-env splits at the last '='.
+        let needs_config_env = driver.contains(&b'=');
+        #[cfg(unix)]
+        let driver = OsStr::from_bytes(driver);
+        #[cfg(not(unix))]
+        let driver = OsStr::new(std::str::from_utf8(driver)?);
+        for (setting, value, variable) in [
+            (".textconv=", marker_command.as_str(), "ZED_BLAME_TEXTCONV"),
+            (".cachetextconv=", "false", "ZED_BLAME_CACHE_TEXTCONV"),
+        ] {
+            let mut option = OsString::new();
+            let config_value = if needs_config_env {
+                command.env(variable, value);
+                option.push("--config-env=");
+                variable
+            } else {
+                command.arg("-c");
+                value
+            };
+            option.push(driver);
+            option.push(setting);
+            option.push(config_value);
+            command.arg(option);
+        }
     }
-    args.push("cat-file".to_string());
-    args.push("--textconv".to_string());
-    args.push(format!("HEAD:{}", path.as_unix_str()));
 
-    let mut child = git
-        .build_command(&args)
+    let mut child = command
+        .args(["cat-file", "--textconv"])
+        .arg(format!("HEAD:{}", path.as_unix_str()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -272,14 +286,10 @@ async fn history_has_textconv(
         return Ok(true);
     }
     if output.len() < marker.len() {
+        // A staged rename can still use the old path's converter when this probe fails.
         return Ok(!child.status().await?.success());
     }
     Ok(false)
-}
-
-async fn preflight_output(git: &GitBinary, args: &[&str]) -> Result<std::process::Output> {
-    let output = git.build_command(args).kill_on_drop(true).output().await?;
-    Ok(output)
 }
 
 async fn run_git_blame(
