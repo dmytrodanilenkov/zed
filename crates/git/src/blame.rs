@@ -120,10 +120,29 @@ async fn stored_contents<'a>(
         encoding != ISO_2022_JP || stdin_encoding == StdinEncoding::WorkingTree;
     let mut encoder = ExactEncoder::new(encoding, has_bom);
     let mut yield_budget = YieldBudget::default();
+    let mut ascii_prefix = true;
+    let mut roman_byte_in_prefix = false;
     for chunk in text::chunks_with_line_ending(content, line_ending) {
-        // In history, JIS Roman state from a preceding line can make 0x5C and 0x7E mean ¥ and ‾.
-        if !lines_encode_independently && chunk.contains(['¥', '‾', '\\', '~']) {
-            return None;
+        if !lines_encode_independently {
+            // A historical line can start in JIS Roman state. Its first Japanese
+            // character switches modes, after which ASCII punctuation is unambiguous.
+            for character in chunk.chars() {
+                match character {
+                    '¥' | '‾' => return None,
+                    '\n' => {
+                        ascii_prefix = true;
+                        roman_byte_in_prefix = false;
+                    }
+                    '\\' | '~' if ascii_prefix => roman_byte_in_prefix = true,
+                    c if !c.is_ascii() => {
+                        if roman_byte_in_prefix {
+                            return None;
+                        }
+                        ascii_prefix = false;
+                    }
+                    _ => {}
+                }
+            }
         }
         encoder.encode(chunk)?;
         yield_budget.spend(chunk.len()).await;
@@ -171,7 +190,7 @@ async fn git_stdin_encoding(
     if encoding == UTF_16LE || encoding == UTF_16BE {
         return Ok(StdinEncoding::Utf8);
     }
-    Ok(if history_may_use_textconv(git, path).await? {
+    Ok(if history_needs_utf8(git, path, encoding == UTF_8).await? {
         StdinEncoding::Utf8
     } else {
         StdinEncoding::Stored
@@ -206,7 +225,7 @@ async fn has_working_tree_encoding(git: &GitBinary, path: &RepoPath) -> Result<b
         }))
 }
 
-async fn history_may_use_textconv(git: &GitBinary, path: &RepoPath) -> Result<bool> {
+async fn history_needs_utf8(git: &GitBinary, path: &RepoPath, utf8_bom: bool) -> Result<bool> {
     let keys = git
         .build_command(&[
             "config",
@@ -263,62 +282,58 @@ async fn history_may_use_textconv(git: &GitBinary, path: &RepoPath) -> Result<bo
         }
     }
 
-    let probe = |path: OsString| {
-        let mut command = git.build_command(&overrides);
-        let mut object = OsString::from("HEAD:");
-        object.push(path);
-        command
-            .args(["cat-file", "--textconv"])
-            .arg(object)
-            .env("ZED_BLAME_TEXTCONV", &marker_command)
-            .env("ZED_BLAME_CACHE_TEXTCONV", "false");
-        probe_textconv(command, marker.as_bytes())
-    };
-    if let Some(selected) = probe(path.as_unix_str().into()).await? {
-        return Ok(selected);
-    }
-
-    let renames = git
+    // An index object lookup loads indexed attributes when .gitattributes is
+    // missing on disk. Use it when the index has the historical file mode.
+    let literal_path = format!(":(top,literal){}", path.as_unix_str());
+    let changes = git
         .build_command(&[
             "diff",
             "--cached",
-            "--find-renames",
-            "--diff-filter=R",
-            "--name-status",
+            "--raw",
+            "--no-renames",
             "-z",
-            "--no-relative",
             "--",
+            &literal_path,
         ])
         .kill_on_drop(true)
         .output()
         .await?;
     anyhow::ensure!(
-        renames.status.success(),
+        changes.status.success(),
         "git diff failed: {}",
-        String::from_utf8_lossy(&renames.stderr)
+        String::from_utf8_lossy(&changes.stderr)
     );
-    let source =
-        renames
-            .stdout
-            .split(|byte| *byte == 0)
-            .tuples()
-            .find_map(|(_, source, destination)| {
-                (destination == path.as_unix_str().as_bytes()).then_some(source)
-            });
-    if let Some(source) = source {
-        #[cfg(unix)]
-        let source = OsStr::from_bytes(source);
-        #[cfg(not(unix))]
-        let source = OsStr::new(std::str::from_utf8(source)?);
-        return Ok(probe(source.into()).await?.unwrap_or(true));
+    let change = changes
+        .stdout
+        .split(|byte| *byte == 0)
+        .tuples()
+        .find_map(|(metadata, name)| (name == path.as_unix_str().as_bytes()).then_some(metadata));
+    let head = format!("HEAD:{}", path.as_unix_str());
+    let index = format!(":{}", path.as_unix_str());
+    let (driver_object, contents_object) = match change.and_then(|metadata| metadata.last()) {
+        // The previous path may have been a directory. Blame can also follow
+        // a different source from the rename recorded in the index.
+        Some(b'A' | b'U') => return Ok(true),
+        Some(b'M') => (&index, &head),
+        Some(_) => (&head, &head),
+        None => (&index, &index),
+    };
+    let mut command = git.build_command(&overrides);
+    command
+        .args(["cat-file", "--textconv", driver_object])
+        .env("ZED_BLAME_TEXTCONV", &marker_command)
+        .env("ZED_BLAME_CACHE_TEXTCONV", "false");
+    match probe_prefix(command, marker.as_bytes()).await? {
+        Some(false) => Ok(false),
+        Some(true) if utf8_bom => {
+            let command = git.build_command(&["cat-file", "--textconv", contents_object]);
+            Ok(probe_prefix(command, b"\xef\xbb\xbf").await? != Some(true))
+        }
+        _ => Ok(true),
     }
-    Ok(true)
 }
 
-async fn probe_textconv(
-    mut command: util::command::Command,
-    marker: &[u8],
-) -> Result<Option<bool>> {
+async fn probe_prefix(mut command: util::command::Command, prefix: &[u8]) -> Result<Option<bool>> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -332,13 +347,13 @@ async fn probe_textconv(
         .context("failed to get stdout from git cat-file command")?;
     let mut output = Vec::new();
     stdout
-        .take(marker.len() as u64)
+        .take(prefix.len() as u64)
         .read_to_end(&mut output)
         .await?;
-    if output == marker {
+    if output == prefix {
         return Ok(Some(true));
     }
-    if output.len() < marker.len() && !child.status().await?.success() {
+    if output.len() < prefix.len() && !child.status().await?.success() {
         return Ok(None);
     }
     Ok(Some(false))

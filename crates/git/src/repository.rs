@@ -5985,14 +5985,29 @@ mod tests {
         // Git uses the supplied buffer for rename detection, so keep a long unchanged line.
         let contents = "café\ncrème\ndéjà\nunchanged ASCII line long enough for rename detection\n";
         let edited = contents.replace("crème", "changed");
-        let rename = ("new.txt", "old.txt", edited.as_str(), &[0, 2, 3][..]);
-        let link = ("link.txt", "link.txt", "café", &[0][..]);
-        for (attributes, driver, (name, original_name, buffer, expected_rows)) in [
-            ("old.txt diff=legacy=latin", "legacy=latin", rename),
-            ("new.txt diff=legacy=latin", "legacy=latin", rename),
-            ("other.txt diff=legacy=latin", "legacy=latin", rename),
-            ("*.txt diff=python", "default", rename),
-            ("link.txt diff=legacy=latin", "legacy=latin", link),
+        for (case, name, original_name, buffer, expected_rows) in [
+            (
+                "two sources",
+                "new.txt",
+                "old.txt",
+                edited.as_str(),
+                &[0, 2, 3][..],
+            ),
+            (
+                "directory replaced",
+                "dir",
+                "old.txt",
+                edited.as_str(),
+                &[0, 2, 3][..],
+            ),
+            (
+                "indexed attributes",
+                "old.txt",
+                "old.txt",
+                edited.as_str(),
+                &[0, 2, 3][..],
+            ),
+            ("symlink", "link.txt", "link.txt", "café", &[0][..]),
         ] {
             let directory = tempfile::tempdir().expect("create test repository directory");
             let work_dir = directory.path();
@@ -6002,17 +6017,17 @@ mod tests {
                 work_dir,
                 [
                     "config",
-                    &format!("diff.{driver}.textconv"),
+                    "diff.legacy=latin.textconv",
                     "iconv -f WINDOWS-1252 -t UTF-8",
                 ],
             );
             fs::write(
                 work_dir.join(".gitattributes"),
-                format!("* -text\n{attributes}\n"),
+                "* -text\nold.txt diff=legacy=latin\nlink.txt diff=legacy=latin\n",
             )
             .expect("write blame attributes");
             git_command(work_dir, ["add", ".gitattributes"]);
-            if name == original_name {
+            if case == "symlink" {
                 fs::write(work_dir.join(name), b"caf\xe9").expect("write link target as a file");
                 let target = git_command_output(work_dir, ["hash-object", "-w", name]);
                 git_command(
@@ -6038,12 +6053,36 @@ mod tests {
                 .expect("write rename source");
                 git_command(work_dir, ["add", original_name]);
             }
+            if case == "two sources" {
+                fs::write(
+                    work_dir.join("other.txt"),
+                    "different source with its own long ASCII line\n",
+                )
+                .expect("write second source");
+                git_command(work_dir, ["add", "other.txt"]);
+            }
+            if case == "directory replaced" {
+                fs::create_dir(work_dir.join("dir")).expect("create directory in HEAD");
+                fs::write(work_dir.join("dir/tracked"), "tracked\n")
+                    .expect("write file in directory");
+                git_command(work_dir, ["add", "dir"]);
+            }
             git_command(work_dir, ["commit", "-m", "Original file"]);
             let original_commit: Oid = git_command_output(work_dir, ["rev-parse", "HEAD"])
                 .parse()
                 .expect("parse original commit ID");
-            if name != original_name {
-                git_command(work_dir, ["mv", original_name, name]);
+            match case {
+                "two sources" => {
+                    git_command(work_dir, ["mv", original_name, "second.txt"]);
+                    git_command(work_dir, ["mv", "other.txt", name]);
+                }
+                "directory replaced" => {
+                    git_command(work_dir, ["rm", "-r", "dir"]);
+                    git_command(work_dir, ["mv", original_name, name]);
+                }
+                "indexed attributes" => fs::remove_file(work_dir.join(".gitattributes"))
+                    .expect("remove working-tree attributes"),
+                _ => {}
             }
             let repo = RealGitRepository::new(
                 &work_dir.join(".git"),
@@ -6071,10 +6110,7 @@ mod tests {
                 );
                 rows.extend(entry.range);
             }
-            assert_eq!(
-                rows, expected_rows,
-                "committed rows for {name} with {attributes}"
-            );
+            assert_eq!(rows, expected_rows, "committed rows for {case}");
         }
     }
 

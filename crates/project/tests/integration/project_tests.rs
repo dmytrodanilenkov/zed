@@ -17115,6 +17115,8 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
         replacement: "changed",
         committed_rows: outer_rows.clone(),
     };
+    let strip_bom = "utf_8_bom_textconv.txt";
+    let keep_bom = "utf_8_bom_identity.txt";
     let cases = [
         case("sjis.c", encoding_rs::SHIFT_JIS, false, shift_jis_text, ""),
         case(
@@ -17181,11 +17183,25 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
         },
         case("utf_8_bom.txt", encoding_rs::UTF_8, true, unicode_text, ""),
         case(
-            "utf_8_bom_textconv.txt",
+            strip_bom,
             encoding_rs::UTF_8,
             true,
             unicode_text,
-            "text eol=lf working-tree-encoding=UTF-8// diff=strip_bom",
+            "text eol=lf working-tree-encoding=UTF-8//IGNORE diff=strip_bom",
+        ),
+        case(
+            keep_bom,
+            encoding_rs::UTF_8,
+            true,
+            unicode_text,
+            "text eol=lf working-tree-encoding=UTF-8//IGNORE diff=keep_bom",
+        ),
+        case(
+            "iso_2022_jp_ascii_path.txt",
+            encoding_rs::ISO_2022_JP,
+            false,
+            "日本語 ~\nplain\n~/.config\n",
+            "-text",
         ),
         // Git can't split raw UTF-16 into lines.
         Case {
@@ -17305,7 +17321,8 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
         "iconv -f WINDOWS-1252 -t UTF-8",
         &work_dir,
     );
-    git_config("diff.strip_bom.textconv", "tail -c +4", &work_dir);
+    git_config("diff.keep_bom.textconv", "cat", &work_dir);
+    git_config("diff.strip_bom.textconv", "sed '1s/^\u{feff}//'", &work_dir);
     let attributes = cases
         .iter()
         .filter(|case| !case.attributes.is_empty())
@@ -17316,12 +17333,28 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
     for case in &cases {
         let bytes = match case.stored_bytes {
             Some(bytes) => bytes.to_vec(),
-            None => file_content::encode_text(case.text.to_owned(), case.encoding, case.has_bom),
+            None => file_content::encode_text(
+                case.text.to_owned(),
+                case.encoding,
+                case.has_bom && ![strip_bom, keep_bom].contains(&case.file_name),
+            ),
         };
         std::fs::write(work_dir.join(case.file_name), bytes).unwrap();
         git_add(case.file_name, &work_dir);
     }
     git_commit("Initial commit", &work_dir);
+    let original_commit: git::Oid = git_rev_parse("HEAD", &work_dir)
+        .parse()
+        .expect("original SHA");
+    for file in [strip_bom, keep_bom] {
+        let bytes = file_content::encode_text(unicode_text.to_owned(), encoding_rs::UTF_8, true);
+        std::fs::write(work_dir.join(file), bytes).expect("add UTF-8 BOM");
+        git_add(file, &work_dir);
+    }
+    git_commit("Add only a BOM", &work_dir);
+    let bom_commit: git::Oid = git_rev_parse("HEAD", &work_dir)
+        .parse()
+        .expect("BOM commit SHA");
 
     let project = Project::test(RealFs::new(None, cx.executor()), [root.path()], cx).await;
     let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
@@ -17356,9 +17389,19 @@ async fn test_blame_buffer_in_non_utf8_encoding(cx: &mut gpui::TestAppContext) {
             blame
                 .entries
                 .iter()
-                .map(|entry| entry.range.clone())
+                .map(|entry| (entry.range.clone(), entry.sha))
                 .collect::<Vec<_>>(),
-            case.committed_rows,
+            case.committed_rows
+                .into_iter()
+                .map(|range| {
+                    let sha = if file_name == keep_bom && range.start == 0 {
+                        bom_commit
+                    } else {
+                        original_commit
+                    };
+                    (range, sha)
+                })
+                .collect::<Vec<_>>(),
             "blame of {file_name}"
         );
     }
